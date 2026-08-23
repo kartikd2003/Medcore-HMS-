@@ -1,0 +1,520 @@
+// MedCore HMS — Core Prisma Schema
+// Multi-tenant Hospital Management Platform
+// Tenancy model: row-level isolation via hospitalId + Prisma middleware
+// (see src/prisma/tenant.middleware.ts). Chosen over db-per-tenant /
+// schema-per-tenant for this scale (30–800 beds) — cheaper ops, single
+// migration path, and Postgres row-level security can be layered on later.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------
+
+enum Role {
+  SUPER_ADMIN
+  HOSPITAL_ADMIN
+  DOCTOR
+  NURSE
+  RECEPTIONIST
+  LAB_TECHNICIAN
+  PHARMACIST
+  ACCOUNTANT
+  PATIENT
+}
+
+enum HospitalStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
+}
+
+enum AppointmentStatus {
+  PENDING
+  CONFIRMED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum LabOrderStatus {
+  ORDERED
+  SAMPLE_COLLECTED
+  RESULT_UPLOADED
+  APPROVED
+  REJECTED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  PENDING
+  PARTIALLY_PAID
+  PAID
+  REFUNDED
+  VOID
+}
+
+enum InvoiceItemSource {
+  CONSULTATION
+  LAB
+  PHARMACY
+  ROOM
+  OTHER
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  SMS
+}
+
+// ---------------------------------------------------------------------
+// Shared / reusable
+// ---------------------------------------------------------------------
+
+model Address {
+  id         String   @id @default(cuid())
+  line1      String
+  line2      String?
+  city       String
+  state      String
+  postalCode String
+  country    String   @default("IN")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  hospital Hospital?
+  patient  Patient?
+}
+
+// ---------------------------------------------------------------------
+// Tenancy root
+// ---------------------------------------------------------------------
+
+model Hospital {
+  id        String         @id @default(cuid())
+  name      String
+  slug      String         @unique
+  status    HospitalStatus @default(PENDING_VERIFICATION)
+  addressId String?        @unique
+  address   Address?       @relation(fields: [addressId], references: [id])
+  phone     String?
+  email     String?
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  users       User[]
+  departments Department[]
+  rooms       Room[]
+  medicines   Medicine[]
+  labTests    LabTest[]
+  auditLogs   AuditLog[]
+
+  @@index([slug])
+}
+
+model Department {
+  id           String   @id @default(cuid())
+  hospitalId   String
+  hospital     Hospital @relation(fields: [hospitalId], references: [id])
+  name         String
+  description  String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  doctors      Doctor[]
+  appointments Appointment[]
+
+  @@unique([hospitalId, name])
+  @@index([hospitalId])
+}
+
+model Room {
+  id         String   @id @default(cuid())
+  hospitalId String
+  hospital   Hospital @relation(fields: [hospitalId], references: [id])
+  label      String
+  ward       String?
+  isOccupied Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([hospitalId, label])
+  @@index([hospitalId])
+}
+
+// ---------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------
+
+model User {
+  id               String    @id @default(cuid())
+  hospitalId       String? // null only for SUPER_ADMIN
+  hospital         Hospital? @relation(fields: [hospitalId], references: [id])
+  email            String    @unique
+  passwordHash     String
+  role             Role
+  firstName        String
+  lastName         String
+  phone            String?
+  isEmailVerified  Boolean   @default(false)
+  isActive         Boolean   @default(true)
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  doctor        Doctor?
+  patient       Patient?
+  refreshTokens RefreshToken[]
+  notifications Notification[]
+  auditLogs     AuditLog[]
+
+  @@index([hospitalId])
+  @@index([email])
+}
+
+// Rotated on every refresh; stored hashed so a DB leak doesn't leak
+// live sessions. Also doubles as the device/session list for a user.
+model RefreshToken {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id])
+  tokenHash  String
+  userAgent  String?
+  ipAddress  String?
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+  @@index([tokenHash])
+}
+
+model Doctor {
+  id           String     @id @default(cuid())
+  userId       String     @unique
+  user         User       @relation(fields: [userId], references: [id])
+  departmentId String
+  department   Department @relation(fields: [departmentId], references: [id])
+  specialty    String?
+  licenseNo    String?
+  bio          String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  availabilities Availability[]
+  appointments   Appointment[]
+  medicalRecords MedicalRecord[]
+
+  @@index([departmentId])
+}
+
+// Weekly recurring availability template. Concrete bookable slots are
+// derived at read-time from (weekday template - existing appointments)
+// and cached in Redis for ~60s; not persisted per-slot to avoid
+// generating rows indefinitely into the future.
+model Availability {
+  id        String   @id @default(cuid())
+  doctorId  String
+  doctor    Doctor   @relation(fields: [doctorId], references: [id])
+  weekday   Int // 0 = Sunday .. 6 = Saturday
+  startTime String // "09:00"
+  endTime   String // "13:00"
+  slotMins  Int      @default(15)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([doctorId, weekday])
+}
+
+model Patient {
+  id           String   @id @default(cuid())
+  userId       String   @unique
+  user         User     @relation(fields: [userId], references: [id])
+  addressId    String?  @unique
+  address      Address? @relation(fields: [addressId], references: [id])
+  dateOfBirth  DateTime?
+  gender       String?
+  bloodGroup   String?
+  allergies    String[] @default([])
+  emergencyContactName  String?
+  emergencyContactPhone String?
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  appointments   Appointment[]
+  medicalRecords MedicalRecord[]
+  invoices       Invoice[]
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------
+// Clinical workflow
+// ---------------------------------------------------------------------
+
+model Appointment {
+  id           String             @id @default(cuid())
+  hospitalId   String
+  patientId    String
+  patient      Patient            @relation(fields: [patientId], references: [id])
+  doctorId     String
+  doctor       Doctor             @relation(fields: [doctorId], references: [id])
+  departmentId String
+  department   Department         @relation(fields: [departmentId], references: [id])
+  scheduledAt  DateTime
+  durationMins Int                @default(15)
+  status       AppointmentStatus  @default(PENDING)
+  reason       String?
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  medicalRecord MedicalRecord?
+  invoice       Invoice?
+
+  @@index([hospitalId])
+  @@index([doctorId, scheduledAt])
+  @@index([patientId])
+  @@index([scheduledAt])
+}
+
+model MedicalRecord {
+  id            String      @id @default(cuid())
+  hospitalId    String
+  appointmentId String      @unique
+  appointment   Appointment @relation(fields: [appointmentId], references: [id])
+  patientId     String
+  patient       Patient     @relation(fields: [patientId], references: [id])
+  doctorId      String
+  doctor        Doctor      @relation(fields: [doctorId], references: [id])
+
+  // Vitals
+  heightCm    Float?
+  weightKg    Float?
+  bloodPressure String?
+  pulseBpm    Int?
+  temperatureC Float?
+
+  diagnosis     String?
+  treatmentPlan String?
+  notes         String?
+
+  // Medical records are never hard-deleted — legal + clinical requirement.
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  prescription Prescription?
+  labOrders    LabOrder[]
+
+  @@index([hospitalId])
+  @@index([patientId])
+  @@index([doctorId])
+}
+
+// ---------------------------------------------------------------------
+// Pharmacy
+// ---------------------------------------------------------------------
+
+model Medicine {
+  id           String   @id @default(cuid())
+  hospitalId   String
+  hospital     Hospital @relation(fields: [hospitalId], references: [id])
+  name         String
+  genericName  String?
+  form         String? // tablet, syrup, injection...
+  strength     String? // "500mg"
+  stockQty     Int      @default(0)
+  reorderLevel Int      @default(10)
+  unitPrice    Decimal  @db.Decimal(10, 2)
+  expiryDate   DateTime?
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  prescriptionItems PrescriptionItem[]
+
+  @@index([hospitalId])
+  @@index([hospitalId, name])
+}
+
+model Prescription {
+  id              String        @id @default(cuid())
+  hospitalId      String
+  medicalRecordId String        @unique
+  medicalRecord   MedicalRecord @relation(fields: [medicalRecordId], references: [id])
+  notes           String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  items PrescriptionItem[]
+
+  @@index([hospitalId])
+}
+
+// Join table carrying per-item dosage/frequency/duration — a plain
+// many-to-many can't hold these, so it's modelled explicitly.
+model PrescriptionItem {
+  id             String       @id @default(cuid())
+  prescriptionId String
+  prescription   Prescription @relation(fields: [prescriptionId], references: [id])
+  medicineId     String
+  medicine       Medicine     @relation(fields: [medicineId], references: [id])
+  dosage         String // "500mg"
+  frequency      String // "1-0-1"
+  durationDays   Int
+  instructions   String?
+  dispensedAt    DateTime?
+
+  @@index([prescriptionId])
+  @@index([medicineId])
+}
+
+// ---------------------------------------------------------------------
+// Laboratory
+// ---------------------------------------------------------------------
+
+model LabTest {
+  id          String   @id @default(cuid())
+  hospitalId  String
+  hospital    Hospital @relation(fields: [hospitalId], references: [id])
+  name        String
+  code        String?
+  price       Decimal  @db.Decimal(10, 2)
+  turnaroundHrs Int?
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  labOrders LabOrder[]
+
+  @@index([hospitalId])
+}
+
+// Hybrid result storage: structured key/value pairs for numeric panels
+// (queryable, chartable) plus an optional attached report file for
+// scanned / imaging results. Covers both cases without two parallel models.
+model LabOrder {
+  id              String         @id @default(cuid())
+  hospitalId      String
+  medicalRecordId String
+  medicalRecord   MedicalRecord  @relation(fields: [medicalRecordId], references: [id])
+  labTestId       String
+  labTest         LabTest        @relation(fields: [labTestId], references: [id])
+  status          LabOrderStatus @default(ORDERED)
+  resultData      Json? // structured key-value results, e.g. { "Hemoglobin": "13.2 g/dL" }
+  resultFileUrl   String? // S3/Cloudinary URL for scanned reports/imaging
+  approvedById    String?
+  approvedAt      DateTime?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([hospitalId])
+  @@index([medicalRecordId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------
+// Billing
+// ---------------------------------------------------------------------
+
+model Invoice {
+  id            String        @id @default(cuid())
+  hospitalId    String
+  appointmentId String?       @unique
+  appointment   Appointment?  @relation(fields: [appointmentId], references: [id])
+  patientId     String
+  patient       Patient       @relation(fields: [patientId], references: [id])
+  status        InvoiceStatus @default(DRAFT)
+  subtotal      Decimal       @db.Decimal(10, 2)
+  tax           Decimal       @db.Decimal(10, 2) @default(0)
+  total         Decimal       @db.Decimal(10, 2)
+  currency      String        @default("INR")
+  paymentGatewayRef String? // Stripe / Razorpay payment intent id
+  paidAt        DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items InvoiceItem[]
+
+  @@index([hospitalId])
+  @@index([patientId])
+  @@index([status])
+}
+
+model InvoiceItem {
+  id          String            @id @default(cuid())
+  invoiceId   String
+  invoice     Invoice           @relation(fields: [invoiceId], references: [id])
+  source      InvoiceItemSource
+  description String
+  quantity    Int               @default(1)
+  unitPrice   Decimal           @db.Decimal(10, 2)
+  lineTotal   Decimal           @db.Decimal(10, 2)
+  sourceRefId String? // e.g. LabOrder.id or PrescriptionItem.id
+
+  @@index([invoiceId])
+}
+
+// ---------------------------------------------------------------------
+// Cross-cutting
+// ---------------------------------------------------------------------
+
+// Polymorphic recipient/target via (entityType, entityId) rather than
+// a relation per notifiable model — keeps this table stable as new
+// notifiable entities are added.
+model Notification {
+  id         String              @id @default(cuid())
+  userId     String
+  user       User                @relation(fields: [userId], references: [id])
+  channel    NotificationChannel
+  title      String
+  body       String
+  entityType String? // "Appointment", "LabOrder", "Invoice"...
+  entityId   String?
+  readAt     DateTime?
+  sentAt     DateTime?
+  createdAt  DateTime            @default(now())
+
+  @@index([userId, readAt])
+}
+
+// Every write operation across the app is logged here (via a Prisma
+// middleware / NestJS interceptor) — required for HIPAA-aware audit
+// trails. entityType/entityId identify the affected row polymorphically.
+model AuditLog {
+  id         String   @id @default(cuid())
+  hospitalId String?
+  hospital   Hospital? @relation(fields: [hospitalId], references: [id])
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id])
+  action     String // "CREATE" | "UPDATE" | "DELETE" | "LOGIN" ...
+  entityType String
+  entityId   String
+  before     Json?
+  after      Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([hospitalId, entityType])
+  @@index([userId])
+  @@index([createdAt])
+}
