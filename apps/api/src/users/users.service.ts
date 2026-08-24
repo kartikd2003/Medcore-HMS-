@@ -1,4 +1,4 @@
-import { Injectable, ConflictException, ForbiddenException } from '@nestjs/common';
+import { Injectable, ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import * as bcrypt from 'bcryptjs';
 import { Role } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -59,7 +59,8 @@ export class UsersService {
   }
 
   async deactivate(admin: AuthenticatedUser, userId: string) {
-    const target = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
+    const target = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!target) throw new NotFoundException('User not found');
     if (admin.role !== Role.HOSPITAL_ADMIN || target.hospitalId !== admin.hospitalId) {
       throw new ForbiddenException('Cannot manage users outside your hospital');
     }
