@@ -10,13 +10,14 @@ backend (`apps/api`) — the only app currently built. `apps/web` and
 |---|---|
 | API framework | NestJS 10 (Express adapter) |
 | ORM / migrations | Prisma 5, PostgreSQL 16 |
-| Cache / queue | Redis 7 via `ioredis`, jobs via BullMQ |
-| Auth | Passport JWT strategies, `bcryptjs` for password hashing |
+| Cache / queue | Redis 7 via `ioredis`, jobs via BullMQ (not yet wired to real usage — see Known gaps) |
+| Auth | Passport JWT strategies, `bcryptjs` for password hashing (chosen over `bcrypt` — it compiles a native binary that Alpine's musl libc frequently can't use prebuilt, causing silent Docker build failures; `bcryptjs` is pure JS, same API) |
 | Realtime | Socket.IO via `@nestjs/websockets` |
 | Validation | `class-validator` / `class-transformer`, global `ValidationPipe` |
 | Rate limiting | `@nestjs/throttler`, global default + per-route overrides |
 | Testing | Jest + Supertest |
 | Local infra | Docker Compose (postgres, redis, api) |
+| CI | GitHub Actions — lint, test, build, Docker build on every push/PR to `main` |
 
 The API is a single NestJS monolith exposing a REST API under
 `/api/v1`, plus one WebSocket namespace (`/realtime`). It is not
@@ -31,7 +32,7 @@ order, so the order here is load-bearing):
 
 1. **`JwtAuthGuard`** — authenticates by default. Verifies the access
    token and populates `req.user`. Routes opt out with `@Public()`
-   (registration, login, OTP verification, public slot browsing).
+   (registration, login, OTP verification, public slot browsing, health check).
 2. **`RolesGuard`** — enforces `@Roles(...)` metadata. A route with no
    `@Roles()` decorator is open to any authenticated user (role
    restriction is opt-in per endpoint, not the default).
@@ -41,11 +42,15 @@ order, so the order here is load-bearing):
    defense-in-depth: the primary control is every service method
    scoping its own Prisma queries by `hospitalId`.
 4. **`ThrottlerGuard`** — 100 requests/60s by default; `POST /auth/login`
-   overrides this to 20/60s at the route level.
+   overrides this to 20/60s at the route level (raised from an initial
+   5/60s after the Week 3 smoke test's six sequential role logins tripped it).
 
 Requests that pass all four reach the controller, which delegates to a
-service that talks to Prisma (and, where relevant, Redis or the
-realtime gateway).
+service that talks to Prisma (and, where relevant, the realtime gateway).
+
+This exact guard chain is what the RBAC test matrix
+(`apps/api/src/test/rbac.spec.ts`) verifies end to end — 389 assertions,
+every protected route against all 9 roles, currently all passing.
 
 ## Tenancy model
 
@@ -77,11 +82,18 @@ Each is a self-contained NestJS module (`controller` + `service` +
 | `lab-orders` | Order → sample collected → result uploaded → approved/rejected |
 | `invoices` | Generation from consultation/lab/pharmacy line items, payment recording |
 | `realtime` | Socket.IO gateway, one room per hospital |
-| `health` | Liveness endpoint |
+| `health` | Liveness endpoint — used by Docker's `HEALTHCHECK` and (eventually) AWS target group health checks |
 | `prisma` | Global Prisma client wrapper |
 
 Cross-cutting: `common/guards` (roles, tenant), `common/decorators`
 (`@Public()`, `@Roles()`, `@CurrentUser()`).
+
+**Role coverage note**: of the 9 roles in the `Role` enum, `NURSE` currently
+has zero `@Roles()`-gated endpoints anywhere in the app — it can only reach
+routes open to any authenticated user. This surfaced directly from building
+the RBAC test matrix rather than being a deliberate design choice; worth a
+decision (build nurse-specific endpoints, or fold nursing tasks into an
+existing role) before this ships.
 
 ## Data model highlights
 
@@ -90,8 +102,8 @@ design choices baked into it:
 
 - **`Availability`** is a weekly recurring template (weekday +
   start/end time), not a row per bookable slot — slots are derived at
-  read time and cached briefly in Redis, avoiding unbounded row growth
-  into the future.
+  read time, avoiding unbounded row growth into the future. Not yet
+  cached (Redis wiring is still a TODO — see Known gaps).
 - **`LabOrder.resultData`** is a hybrid: a `Json` field for structured
   numeric panels (queryable, chartable) plus an optional
   `resultFileUrl` for scanned reports or imaging, covering both cases
@@ -105,8 +117,12 @@ design choices baked into it:
 - **`Notification`** and **`AuditLog`** use polymorphic
   `(entityType, entityId)` pairs rather than a relation per notifiable
   or auditable model, so both stay stable as new entities are added.
-  `AuditLog` is written on every state-changing operation across the
-  app — a HIPAA-aware audit trail requirement.
+  `Notification` is actually wired up (low-stock alerts on dispense).
+  **`AuditLog` is modeled but not yet used anywhere** — no service in
+  the codebase currently writes to it, despite the model existing for
+  exactly this purpose. This is a real gap, not a subtle one: a
+  HIPAA-aware audit trail was part of the original intent and isn't
+  built yet.
 - Clinically or legally significant records (`MedicalRecord`,
   `Patient`, `Medicine`, `LabTest`) use soft deletes (`deletedAt`);
   nothing clinical is ever hard-deleted.
@@ -231,6 +247,12 @@ service layer).
 | GET | `/` | RECEPTIONIST, ACCOUNTANT, HOSPITAL_ADMIN |
 | GET | `/:id` | Any authenticated |
 
+### Health (`/health`)
+
+| Method | Path | Access |
+|---|---|---|
+| GET | `/` | Public — round-trips a real DB query (`SELECT 1`), not just process liveness |
+
 ## Local infrastructure
 
 `docker-compose.yml` runs three services: `postgres` (16-alpine),
@@ -239,17 +261,37 @@ the compose network, the API reaches Postgres/Redis by service name
 (`postgres`, `redis`); `.env` uses `localhost` for running the API
 outside Docker against containerized dependencies.
 
+The API's `Dockerfile` is a two-stage build:
+
+- **`builder`** — full toolchain (`npm ci`, not `npm install`, for
+  reproducible installs from the lockfile), generates the Prisma
+  client, compiles TypeScript.
+- **`runtime`** — production dependencies only (`npm ci --omit=dev`).
+  `prisma` (the CLI) is deliberately a production dependency, not a
+  devDependency, because the container's entrypoint runs
+  `prisma migrate deploy` on startup — stripping it to a lean image
+  would have silently broken that. Runs as the non-root `node` user.
+  Exposes a Docker `HEALTHCHECK` against `/api/v1/health`.
+
 Key environment variables (`.env.example`): `DATABASE_URL`, `REDIS_URL`,
 `JWT_ACCESS_SECRET` / `JWT_ACCESS_TTL`, `JWT_REFRESH_SECRET` /
 `JWT_REFRESH_TTL`, `PORT` (3001), `CORS_ORIGIN`, and
 `NEXT_PUBLIC_API_URL` (reserved for the not-yet-built `apps/web`).
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push/PR to `main`: install →
+generate Prisma client → lint → test (the RBAC matrix) → build → build the
+Docker image. Verified passing on GitHub's own infrastructure, not just
+locally.
 
 ## Testing
 
 `apps/api/src/test/rbac.spec.ts` runs a declarative matrix — every
 protected route against every role in the `Role` enum — asserting each
 combination gets the expected allow/deny, rather than hand-writing
-per-endpoint role assertions. Three shell scripts
+per-endpoint role assertions. 389 assertions, currently all passing,
+verified both locally and in CI. Three shell scripts
 (`scripts/smoke-test.sh`, `week2-smoke-test.sh`, `week3-smoke-test.sh`)
 exercise the full HTTP flow for each phase of the build against a
 running instance, using `curl` + `jq`.
@@ -259,4 +301,7 @@ running instance, using `curl` + `jq`.
 - `apps/web` (Next.js) is not scaffolded.
 - OTP delivery is stubbed — `auth.service.ts` has `TODO` markers where
   email/Redis cache calls belong.
-- No CI pipeline or deployment configuration yet.
+- `AuditLog` is modeled in the schema but not written anywhere yet —
+  see Data model highlights above.
+- `NURSE` role has no gated endpoints yet — see Domain modules above.
+- No AWS deployment configuration yet (CI itself is done and passing).

@@ -1,6 +1,7 @@
 # ---- Builder: full toolchain, compiles TypeScript -> dist/ ----
 FROM node:20-alpine AS builder
 WORKDIR /app
+RUN apk add --no-cache openssl
 
 COPY package*.json ./
 # npm ci (not install) — installs exactly what package-lock.json pins,
@@ -14,7 +15,11 @@ RUN npm run build
 # ---- Runtime: production deps only, no dev toolchain in the final image ----
 FROM node:20-alpine AS runtime
 WORKDIR /app
+RUN apk add --no-cache openssl
+
+
 ENV NODE_ENV=production
+RUN apk add --no-cache openssl
 
 COPY package*.json ./
 # --omit=dev keeps this image lean and off the attack surface of
@@ -40,4 +45,4 @@ USER node
 EXPOSE 3001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD wget -qO- http://localhost:3001/api/v1/health || exit 1
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/main"]
+CMD ["sh", "-c", "npx prisma migrate deploy && node dist/src/main"]

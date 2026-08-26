@@ -1,35 +1,46 @@
 # MedCore HMS
 
 Multi-tenant hospital management platform. Monorepo: `apps/api` (NestJS +
-Prisma + PostgreSQL), `apps/web` (Next.js, not yet scaffolded), `packages/types`
-(shared types, not yet scaffolded).
+Prisma + PostgreSQL) — built and tested. `apps/web` (Next.js) and
+`packages/types` are scaffolded in the layout but have no code yet;
+frontend work is planned as its own phase after the backend.
 
-## Status: Week 1 — Foundation ✅
+See [`Architecture.md`](./Architecture.md) for the full technical writeup —
+request lifecycle, tenancy model, data model, and complete API reference.
 
-- [x] Prisma schema — 18 models, row-level tenant isolation via `hospitalId`
-- [x] JWT auth — register + OTP verification, login, refresh rotation with reuse
-      detection, logout
-- [x] RBAC — `JwtAuthGuard` (auth-by-default) → `RolesGuard` (`@Roles()`) →
-      `TenantGuard` (cross-tenant block), applied globally in that order
-- [x] Hospital onboarding — Super Admin creates a hospital + its first admin
-      atomically; activate/suspend
-- [x] Staff provisioning — Hospital Admin creates staff scoped to their own
-      hospital only
-- [x] Seed script — one full tenant (super admin, hospital admin, doctor,
-      patient) for immediate testing
-- [x] Docker Compose — postgres, redis, api
-- [x] Smoke-test script covering the full flow, including a tenant-isolation
-      check
+## Status
 
-Not yet built: `apps/web` frontend, OTP email delivery (stubbed —
-`auth.service.ts` has `TODO` markers where the email/Redis cache calls go),
-availability/appointments/EMR (Week 2), pharmacy/lab/billing (Week 3), CI +
-deployment (Week 4).
+**Weeks 1–3 (backend features) and Week 4 (backend ops) are complete.**
+Frontend has not been started.
+
+- [x] **Week 1 — Foundation**: Prisma schema (18 models, row-level tenant
+      isolation), JWT auth with refresh rotation + reuse detection, RBAC
+      (`JwtAuthGuard` → `RolesGuard` → `TenantGuard`), hospital onboarding,
+      staff provisioning, seed script, Docker Compose
+- [x] **Week 2 — Clinical core**: doctor availability templates + derived
+      bookable slots, appointment booking with conflict protection, status
+      lifecycle, medical records (auto-completes the appointment), Socket.IO
+      real-time gateway with per-hospital rooms
+- [x] **Week 3 — Pharmacy, lab, billing**: medicine inventory, lab test
+      catalog, prescriptions wired into medical records, pharmacist dispense
+      flow with low-stock notifications, lab order lifecycle
+      (ordered → collected → result → approved/rejected), invoice generation
+      from consultation + pharmacy + lab charges, payment recording
+- [x] **Week 4 — Backend ops**: production-hardened multi-stage Dockerfile
+      (non-root user, `/health` endpoint + `HEALTHCHECK`, `bcryptjs` instead
+      of native-compiling `bcrypt`), GitHub Actions CI (lint → test → build →
+      Docker build, verified passing), and an automated RBAC test matrix
+      (`apps/api/src/test/rbac.spec.ts`) — 389 assertions covering every
+      protected route against all 9 roles, all passing
+- [ ] AWS deployment — not yet done
+- [ ] `apps/web` frontend — not yet started
+- [ ] OTP email delivery — stubbed (`TODO` markers in `auth.service.ts`
+      where the Redis cache / email queue calls belong)
 
 ## Running locally
 
 ```bash
-cp .env.example .env          # edit secrets before anything but local dev
+cp apps/api/.env.example apps/api/.env   # edit secrets before anything but local dev
 docker compose up -d postgres redis
 cd apps/api
 npm install
@@ -38,36 +49,52 @@ npm run seed                  # seeds City General Hospital + one user per role
 npm run start:dev             # API on http://localhost:3001/api/v1
 ```
 
-Then, in another terminal:
+Then, in another terminal, any of the three phase smoke tests:
 
 ```bash
-./scripts/smoke-test.sh       # requires curl + jq
+./scripts/smoke-test.sh          # Week 1: auth, RBAC, tenant isolation
+./scripts/week2-smoke-test.sh    # Week 2: booking through to a completed consult
+./scripts/week3-smoke-test.sh    # Week 3: prescribe → dispense → lab → invoice → pay
 ```
 
-Seeded accounts (password `Password123!` for all):
+Or the automated RBAC matrix:
+
+```bash
+cd apps/api && npm test
+```
+
+Or the full Docker stack (uses its own empty database, separate from your
+native Postgres):
+
+```bash
+docker compose up -d
+curl http://localhost:3001/api/v1/health
+```
+
+## Seeded accounts
+
+Password `Password123!` for all. All except Super Admin belong to **City
+General Hospital**.
 
 | Role | Email |
 |---|---|
 | Super Admin | `superadmin@medcore.dev` |
 | Hospital Admin | `admin@citygeneral.dev` |
-| Doctor | `doctor@citygeneral.dev` |
+| Doctor | `doctor@citygeneral.dev` (Mon–Fri 9:00–13:00 availability, 15-min slots) |
+| Receptionist | `reception@citygeneral.dev` |
+| Pharmacist | `pharmacist@citygeneral.dev` |
+| Lab Technician | `labtech@citygeneral.dev` |
+| Accountant | `accountant@citygeneral.dev` |
 | Patient | `patient@example.dev` |
 
-## Architecture notes
+Seeded catalog: Paracetamol, Amoxicillin (medicines); Complete Blood Count,
+Lipid Profile (lab tests).
 
-- **Tenancy**: row-level, not schema- or database-per-tenant. Every
-  tenant-scoped table carries `hospitalId`; `TenantGuard` rejects any request
-  whose route/query/body `hospitalId` doesn't match the caller's own, and
-  `SUPER_ADMIN` is the only role exempt. Service-layer queries must still
-  scope by `hospitalId` themselves — the guard is defense-in-depth, not the
-  primary control.
-- **Refresh tokens** are stored hashed and rotated on every use. Presenting an
-  already-revoked token is treated as a theft signal and revokes every active
-  session for that user.
-- **Staff accounts** are never self-service — only `HOSPITAL_ADMIN` can create
-  `DOCTOR`/`NURSE`/etc., and only within their own hospital.
+## CI
 
-## Next: Week 2
+Every push/PR to `main` runs lint, the RBAC test suite, a production build,
+and a Docker image build — see `.github/workflows/ci.yml`.
 
-Doctor availability templates, appointment booking, medical records tied to
-completed appointments, and a Socket.IO gateway for real-time status updates.
+## Next
+
+AWS deployment for the API, then the Next.js frontend as its own phase.
