@@ -1,46 +1,38 @@
 # MedCore HMS
 
 Multi-tenant hospital management platform. Monorepo: `apps/api` (NestJS +
-Prisma + PostgreSQL) — built and tested. `apps/web` (Next.js) and
-`packages/types` are scaffolded in the layout but have no code yet;
-frontend work is planned as its own phase after the backend.
+Prisma + PostgreSQL + Redis), `apps/web` (Next.js — not yet scaffolded),
+`packages/types` (shared types — not yet scaffolded).
 
-See [`Architecture.md`](./Architecture.md) for the full technical writeup —
-request lifecycle, tenancy model, data model, and complete API reference.
+## Status: Weeks 1–4 — backend complete ✅
 
-## Status
+- **Foundation** — Prisma schema (18 models, row-level tenant isolation via
+  `hospitalId`); JWT auth with OTP verification, refresh rotation + reuse
+  detection, logout; three-guard RBAC pipeline; hospital onboarding; staff
+  provisioning; seed script; Docker Compose; smoke tests.
+- **Scheduling & records** — doctor availability templates, slot lookup,
+  appointment booking and status transitions, medical records tied to
+  completed appointments, a Socket.IO gateway broadcasting appointment
+  events per hospital.
+- **Pharmacy, lab, billing** — medicine catalog + stock adjustment,
+  prescriptions generated from a medical record and dispensed item-by-item,
+  lab test catalog, lab orders (order → collect → result → approve/reject),
+  invoice generation from consultation/lab/pharmacy line items and payment
+  recording.
+- **Hardening** — an RBAC test matrix (`src/test/rbac.spec.ts`) asserting
+  every route against every role; fixes to FK ordering and error codes
+  surfaced by that suite.
 
-**Weeks 1–3 (backend features) and Week 4 (backend ops) are complete.**
-Frontend has not been started.
+Not yet built: `apps/web` frontend, OTP email delivery (stubbed — see the
+`TODO` markers in `auth.service.ts`), CI pipeline, deployment config.
 
-- [x] **Week 1 — Foundation**: Prisma schema (18 models, row-level tenant
-      isolation), JWT auth with refresh rotation + reuse detection, RBAC
-      (`JwtAuthGuard` → `RolesGuard` → `TenantGuard`), hospital onboarding,
-      staff provisioning, seed script, Docker Compose
-- [x] **Week 2 — Clinical core**: doctor availability templates + derived
-      bookable slots, appointment booking with conflict protection, status
-      lifecycle, medical records (auto-completes the appointment), Socket.IO
-      real-time gateway with per-hospital rooms
-- [x] **Week 3 — Pharmacy, lab, billing**: medicine inventory, lab test
-      catalog, prescriptions wired into medical records, pharmacist dispense
-      flow with low-stock notifications, lab order lifecycle
-      (ordered → collected → result → approved/rejected), invoice generation
-      from consultation + pharmacy + lab charges, payment recording
-- [x] **Week 4 — Backend ops**: production-hardened multi-stage Dockerfile
-      (non-root user, `/health` endpoint + `HEALTHCHECK`, `bcryptjs` instead
-      of native-compiling `bcrypt`), GitHub Actions CI (lint → test → build →
-      Docker build, verified passing), and an automated RBAC test matrix
-      (`apps/api/src/test/rbac.spec.ts`) — 389 assertions covering every
-      protected route against all 9 roles, all passing
-- [ ] AWS deployment — not yet done
-- [ ] `apps/web` frontend — not yet started
-- [ ] OTP email delivery — stubbed (`TODO` markers in `auth.service.ts`
-      where the Redis cache / email queue calls belong)
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for how the pieces fit together and
+a full endpoint reference.
 
 ## Running locally
 
 ```bash
-cp apps/api/.env.example apps/api/.env   # edit secrets before anything but local dev
+cp .env.example .env          # edit secrets before anything but local dev
 docker compose up -d postgres redis
 cd apps/api
 npm install
@@ -49,52 +41,59 @@ npm run seed                  # seeds City General Hospital + one user per role
 npm run start:dev             # API on http://localhost:3001/api/v1
 ```
 
-Then, in another terminal, any of the three phase smoke tests:
+Then, in another terminal:
 
 ```bash
-./scripts/smoke-test.sh          # Week 1: auth, RBAC, tenant isolation
-./scripts/week2-smoke-test.sh    # Week 2: booking through to a completed consult
-./scripts/week3-smoke-test.sh    # Week 3: prescribe → dispense → lab → invoice → pay
+./scripts/smoke-test.sh          # Week 1 flow: auth, onboarding, staff, tenant isolation
+./scripts/week2-smoke-test.sh    # Week 2 flow: availability, booking, medical records, realtime
+./scripts/week3-smoke-test.sh    # Week 3 flow: prescribe, dispense, lab results, billing
 ```
 
-Or the automated RBAC matrix:
+All three require `curl` and `jq`.
 
-```bash
-cd apps/api && npm test
-```
-
-Or the full Docker stack (uses its own empty database, separate from your
-native Postgres):
-
-```bash
-docker compose up -d
-curl http://localhost:3001/api/v1/health
-```
-
-## Seeded accounts
-
-Password `Password123!` for all. All except Super Admin belong to **City
-General Hospital**.
+Seeded accounts (password `Password123!` for all):
 
 | Role | Email |
 |---|---|
 | Super Admin | `superadmin@medcore.dev` |
 | Hospital Admin | `admin@citygeneral.dev` |
-| Doctor | `doctor@citygeneral.dev` (Mon–Fri 9:00–13:00 availability, 15-min slots) |
+| Doctor | `doctor@citygeneral.dev` |
+| Patient | `patient@example.dev` |
 | Receptionist | `reception@citygeneral.dev` |
 | Pharmacist | `pharmacist@citygeneral.dev` |
 | Lab Technician | `labtech@citygeneral.dev` |
 | Accountant | `accountant@citygeneral.dev` |
-| Patient | `patient@example.dev` |
 
-Seeded catalog: Paracetamol, Amoxicillin (medicines); Complete Blood Count,
-Lipid Profile (lab tests).
+## Architecture notes
 
-## CI
-
-Every push/PR to `main` runs lint, the RBAC test suite, a production build,
-and a Docker image build — see `.github/workflows/ci.yml`.
+- **Tenancy**: row-level, not schema- or database-per-tenant. Every
+  tenant-scoped table carries `hospitalId`; `TenantGuard` rejects any request
+  whose route/query/body `hospitalId` doesn't match the caller's own, and
+  `SUPER_ADMIN` is the only role exempt. Service-layer queries must still
+  scope by `hospitalId` themselves — the guard is defense-in-depth, not the
+  primary control.
+- **Guard order matters**: `JwtAuthGuard` (auth-by-default, opt out with
+  `@Public()`) → `RolesGuard` (`@Roles()`, opt-in per route) → `TenantGuard`
+  (cross-tenant block) → `ThrottlerGuard`, registered globally in that order
+  in `app.module.ts`.
+- **Refresh tokens** are stored hashed and rotated on every use. Presenting
+  an already-revoked token is treated as a theft signal and revokes every
+  active session for that user.
+- **Staff accounts** are never self-service — only `HOSPITAL_ADMIN` can
+  create `DOCTOR`/`NURSE`/etc., and only within their own hospital.
+- **Availability** is a weekly recurring template, not persisted per-slot;
+  bookable slots are derived at read-time (template minus existing
+  appointments) and cached in Redis briefly to avoid recomputing per request.
+- **Realtime**: one Socket.IO room per hospital (`hospital:<id>`). A client's
+  room membership is resolved from their verified JWT server-side, not from
+  client input, so a socket can't join another tenant's room.
+- **Medical records are never hard-deleted** — a legal and clinical
+  requirement carried through to lab orders and prescriptions attached to
+  them.
+- **Every write is audited** via `AuditLog`, keyed polymorphically by
+  `(entityType, entityId)`.
 
 ## Next
 
-AWS deployment for the API, then the Next.js frontend as its own phase.
+CI/CD pipeline, deployment configuration, and the `apps/web` Next.js
+frontend.

@@ -9,6 +9,26 @@ export class DoctorsService {
   constructor(private prisma: PrismaService) {}
 
   /**
+   * Public doctor directory for booking — only doctors at an ACTIVE
+   * hospital, so a pending/suspended tenant's doctors don't show up
+   * to a prospective patient. Includes department and name — enough
+   * to pick someone to book with without exposing anything sensitive.
+   */
+  async listForHospital(hospitalId: string) {
+    if (!hospitalId) {
+      throw new NotFoundException('hospitalId is required');
+    }
+    return this.prisma.doctor.findMany({
+      where: { department: { hospitalId, hospital: { status: 'ACTIVE' } } },
+      include: {
+        user: { select: { firstName: true, lastName: true } },
+        department: { select: { name: true } },
+      },
+      orderBy: { user: { firstName: 'asc' } },
+    });
+  }
+
+  /**
    * A doctor edits their own weekly template as a whole: existing
    * slots are replaced, not merged. Kept transactional so a partial
    * write never leaves a doctor with half their old week and half
@@ -42,10 +62,7 @@ export class DoctorsService {
    * weekly template, minus any slot that already overlaps a
    * non-cancelled appointment. Computed on read rather than
    * persisted per-slot — persisting would mean generating rows
-   * indefinitely into the future for every doctor. This is the
-   * natural place to add a short Redis cache (see schema.prisma
-   * comment) once Week 2's Redis wiring lands; deliberately left
-   * uncached for now so the logic itself stays easy to verify.
+   * indefinitely into the future for every doctor.
    */
   async getAvailableSlots(doctorId: string, dateStr: string) {
     await this.assertDoctorExists(doctorId);

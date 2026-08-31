@@ -10,14 +10,6 @@ const SALT_ROUNDS = 12;
 export class HospitalsService {
   constructor(private prisma: PrismaService) {}
 
-  /**
-   * Creates the hospital and its first HOSPITAL_ADMIN in a single
-   * transaction — a hospital that exists without an admin can never
-   * be logged into, so partial success here would leave an orphaned,
-   * unusable tenant. New hospitals start PENDING_VERIFICATION; a
-   * separate activate() call (Super Admin only) flips them ACTIVE
-   * once compliance/KYC checks are done.
-   */
   async onboard(dto: CreateHospitalDto) {
     const [slugTaken, emailTaken] = await Promise.all([
       this.prisma.hospital.findUnique({ where: { slug: dto.slug } }),
@@ -86,11 +78,25 @@ export class HospitalsService {
     });
   }
 
-  /** Super Admin only — the one cross-tenant read in the system. */
   async listAll() {
     return this.prisma.hospital.findMany({
       where: { deletedAt: null },
       orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  /**
+   * Public-safe subset for a prospective patient picking a hospital
+   * before browsing its doctors — id/name/slug only, ACTIVE only.
+   * Deliberately not reusing listAll(): that returns every field
+   * (email, phone, full address, PENDING/SUSPENDED tenants) which
+   * isn't appropriate to expose with no authentication at all.
+   */
+  async listPublic() {
+    return this.prisma.hospital.findMany({
+      where: { deletedAt: null, status: HospitalStatus.ACTIVE },
+      select: { id: true, name: true, slug: true },
+      orderBy: { name: 'asc' },
     });
   }
 

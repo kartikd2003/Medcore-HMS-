@@ -13,6 +13,21 @@ import { SetAvailabilityDto } from './dto/set-availability.dto';
 export class DoctorsController {
   constructor(private doctorsService: DoctorsService) {}
 
+  /**
+   * Public doctor directory, filtered by hospital — added so a
+   * prospective patient can find a doctor to book with. Without this,
+   * a patient could only interact with a doctor whose id they already
+   * happened to know, which made booking impossible for a real user.
+   * hospitalId is required (not optional) — listing every doctor
+   * across every tenant with no scoping isn't appropriate for a
+   * public, unauthenticated endpoint.
+   */
+  @Public()
+  @Get()
+  listPublic(@Query('hospitalId') hospitalId: string) {
+    return this.doctorsService.listForHospital(hospitalId);
+  }
+
   @Roles(Role.DOCTOR)
   @Get('me')
   getOwnProfile(@CurrentUser() user: AuthenticatedUser) {
@@ -30,8 +45,6 @@ export class DoctorsController {
     return this.doctorsService.getAvailability(doctorId);
   }
 
-  // Public so a patient can browse slots before/without logging in;
-  // actually booking one still requires auth (see AppointmentsController).
   @Public()
   @Get(':doctorId/slots')
   getAvailableSlots(@Param('doctorId') doctorId: string, @Query('date') date: string) {
