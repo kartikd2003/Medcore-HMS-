@@ -203,8 +203,10 @@ describe('RBAC matrix (e2e)', () => {
           const isAllowed = route.allowedRoles === 'ANY_AUTHENTICATED' || route.allowedRoles.includes(role);
 
           it(`${isAllowed ? 'allows' : 'blocks'} ${role}`, async () => {
-            const res = await request(app.getHttpServer())
-              [route.method](`/api/v1${resolvePath(route.path)}`)
+            const req = request(app.getHttpServer());
+            const res = await req[route.method as 'get' | 'post' | 'put' | 'delete' | 'patch'](
+              `/api/v1${resolvePath(route.path)}`
+            )
               .set('Authorization', `Bearer ${tokens[role]}`)
               .send({});
 
