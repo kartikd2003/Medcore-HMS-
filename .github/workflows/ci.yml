@@ -14,6 +14,36 @@ jobs:
       run:
         working-directory: apps/api
 
+    # The RBAC test suite (added after this workflow was first written)
+    # boots the full Nest app, which needs a real Postgres to migrate
+    # against and real JWT secrets to construct the auth strategies —
+    # neither existed here before because no test that needed them did
+    # either. This service container gives CI its own throwaway
+    # database, isolated from any real environment.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: medcore
+          POSTGRES_PASSWORD: medcore
+          POSTGRES_DB: medcore_hms_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U medcore"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://medcore:medcore@localhost:5432/medcore_hms_ci?schema=public
+      JWT_ACCESS_SECRET: ci-test-access-secret-not-for-production
+      JWT_ACCESS_TTL: 15m
+      JWT_REFRESH_SECRET: ci-test-refresh-secret-not-for-production
+      JWT_REFRESH_TTL: 7d
+      PORT: 3001
+      CORS_ORIGIN: http://localhost:3000
+
     steps:
       - uses: actions/checkout@v4
 
@@ -26,19 +56,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Needs real network access to Prisma's engine CDN — this step
-      # will fail in any sandbox that blocks that (see project notes),
-      # but GitHub-hosted runners have unrestricted outbound access.
       - name: Generate Prisma client
         run: npx prisma generate
+
+      - name: Apply migrations to the CI database
+        run: npx prisma migrate deploy
 
       - name: Lint
         run: npm run lint
 
-      # --passWithNoTests: no .spec.ts files exist yet (see the RBAC
-      # test matrix task). Once real tests land, this flag stops
-      # mattering — Jest just finds and runs them normally, and a
-      # real failure still fails the build as it should.
       - name: Test
         run: npm test -- --passWithNoTests
 
